@@ -413,6 +413,38 @@ def test_v3_gif(test_images):
     assert img.shape == (36, 150, 200, 4)
 
 
+def test_legacy_frame_metadata(test_images):
+    # regression test: get_meta_data(i) used to raise IndexError for any i > 0
+    fname = test_images / "newtonscradle.gif"
+
+    reader = imageio.get_reader(fname, format="GIF-PIL")
+    try:
+        # global metadata and frame 0 keep working
+        assert isinstance(reader.get_meta_data(), dict)
+        assert isinstance(reader.get_meta_data(0), dict)
+
+        # arbitrary frames now report their own metadata
+        meta_1 = reader.get_meta_data(1)
+        meta_5 = reader.get_meta_data(5)
+        assert isinstance(meta_1, dict) and isinstance(meta_5, dict)
+
+        # out-of-range indices still raise, including negative ones
+        with pytest.raises(IndexError):
+            reader.get_meta_data(len(reader))
+        with pytest.raises(IndexError):
+            reader.get_meta_data(-1)
+    finally:
+        reader.close()
+
+    # single-frame images keep rejecting out-of-range metadata indices
+    reader = imageio.get_reader(test_images / "chelsea.png", format="PNG-PIL")
+    try:
+        with pytest.raises(IndexError):
+            reader.get_meta_data(2)
+    finally:
+        reader.close()
+
+
 @deprecated_test
 def test_images_with_transparency(test_images):
     # Not alpha channel, but transparent pixels, see issue #245 and #246

@@ -340,8 +340,18 @@ class PillowFormat(Format):
             return im, self._im.info
 
         def _get_meta_data(self, index):
-            if not (index is None or index == 0):
-                raise IndexError()
+            if index is None:
+                # global metadata: report the metadata of the first frame
+                index = 0
+            if index >= self._length or index < 0:
+                raise IndexError("Image index %i > %i" % (index, self._length))
+
+            if self._im.tell() != index:
+                # seek to the requested frame so that frame-specific metadata
+                # (e.g. the per-frame duration of animated GIFs) is reported
+                self._seek(index)
+            # some formats (e.g. WebP) only populate frame metadata after load
+            self._im.load()
             return self._im.info
 
     class Writer(Format.Writer):

@@ -46,6 +46,12 @@ def pillow_version() -> Tuple[int]:
     return tuple(int(x) for x in pil_version.split("."))
 
 
+def _is_animated(image: Image) -> bool:
+    """Whether the given Pillow image contains more than one frame."""
+
+    return bool(getattr(image, "is_animated", False))
+
+
 def _exif_orientation_transform(orientation: int, mode: str) -> Callable:
     # get transformation that transforms an image from a
     # given EXIF orientation into the standard orientation
@@ -100,6 +106,10 @@ class PillowPlugin(PluginV3):
 
         self._image: Image = None
         self.images_to_write = []
+        # per-frame durations (in ms) accumulated across streamed writes
+        self._durations_to_write = []
+        # kwargs that describe the whole container rather than a single frame
+        self._container_args = {}
 
         if request.mode.io_mode == IOMode.read:
             try:
@@ -172,7 +182,7 @@ class PillowPlugin(PluginV3):
             If index is an ellipsis (...), read all ndimages in the file and
             stack them along a new batch dimension and return them. If index is
             None, this plugin reads the first image of the file (index=0) unless
-            the image is a GIF or APNG, in which case all images are read
+            the image is animated, in which case all images are read
             (index=...).
         mode : str
             Convert the image to the given mode before returning it. If None,
@@ -240,9 +250,7 @@ class PillowPlugin(PluginV3):
             )
 
         if index is None:
-            if self._image.format == "GIF":
-                index = Ellipsis
-            elif self._image.custom_mimetype == "image/apng":
+            if _is_animated(self._image):
                 index = Ellipsis
             else:
                 index = 0
@@ -441,7 +449,23 @@ class PillowPlugin(PluginV3):
         if not is_batch:
             ndimage = ndimage[None, ...]
 
-        for frame in ndimage:
+        # duration is a per-frame property; pull it out of the shared kwargs
+        # so that a later write() call can not overwrite the durations of the
+        # frames accumulated earlier. Frames without an explicit duration
+        # inherit the most recent one.
+        duration = kwargs.pop("duration", None)
+        if duration is not None and not isinstance(duration, (list, tuple)):
+            duration = [duration] * len(ndimage)
+        if duration is not None:
+            duration = list(duration)
+            if len(duration) != len(ndimage):
+                raise ValueError(
+                    "The number of provided durations "
+                    f"({len(duration)}) does not match the number of frames "
+                    f"({len(ndimage)})."
+                )
+
+        for frame_idx, frame in enumerate(ndimage):
             if mode is None:
                 pil_frame = Image.fromarray(frame)
             else:
@@ -450,12 +474,19 @@ class PillowPlugin(PluginV3):
                 pil_frame = pil_frame.quantize(colors=2 ** kwargs["bits"])
             self.images_to_write.append(pil_frame)
 
+            if duration is not None:
+                self._durations_to_write.append(duration[frame_idx])
+            elif self._durations_to_write:
+                # carry the last duration forward instead of clobbering the
+                # durations of previously written frames
+                self._durations_to_write.append(self._durations_to_write[-1])
+
         if (
             format is not None
-            and "format" in self.save_args
-            and self.save_args["format"] != format
+            and "format" in self._container_args
+            and self._container_args["format"] != format
         ):
-            old_format = self.save_args["format"]
+            old_format = self._container_args["format"]
             warnings.warn(
                 "Changing the output format during incremental"
                 " writes is strongly discouraged."
@@ -464,7 +495,13 @@ class PillowPlugin(PluginV3):
             )
 
         extension = self.request.extension or self.request.format_hint
-        self.save_args["format"] = format or Image.registered_extensions()[extension]
+        self._container_args["format"] = (
+            format or Image.registered_extensions()[extension]
+        )
+        # `loop` is a container-level option and must survive until flush even
+        # if later write() calls omit it.
+        if "loop" in kwargs:
+            self._container_args["loop"] = kwargs.pop("loop")
         self.save_args.update(kwargs)
 
         # when writing to `bytes` we flush instantly
@@ -482,13 +519,28 @@ class PillowPlugin(PluginV3):
 
         primary_image = self.images_to_write.pop(0)
 
-        if len(self.images_to_write) > 0:
-            self.save_args["save_all"] = True
-            self.save_args["append_images"] = self.images_to_write
+        save_args = dict(self._container_args)
+        save_args.update(self.save_args)
 
-        primary_image.save(self._request.get_file(), **self.save_args)
+        if len(self.images_to_write) > 0:
+            save_args["save_all"] = True
+            save_args["append_images"] = self.images_to_write
+
+        if self._durations_to_write:
+            primary_duration = self._durations_to_write.pop(0)
+            if self._durations_to_write:
+                save_args["duration"] = [
+                    primary_duration,
+                    *self._durations_to_write,
+                ]
+            else:
+                save_args["duration"] = primary_duration
+
+        primary_image.save(self._request.get_file(), **save_args)
         self.images_to_write.clear()
+        self._durations_to_write.clear()
         self.save_args.clear()
+        self._container_args.clear()
 
     def get_meta(self, *, index=0) -> Dict[str, Any]:
         return self.metadata(index=index, exclude_applied=False)
@@ -505,8 +557,10 @@ class PillowPlugin(PluginV3):
             integer, select the index-th ndimage from among them and return its
             metadata. If index is an ellipsis (...), read and return global
             metadata. If index is None, this plugin reads metadata from the
-            first image of the file (index=0) unless the image is a GIF or APNG,
-            in which case global metadata is read (index=...).
+            first image of the file (index=0) unless the image is animated, in
+            which case global metadata is read (index=...). For animated
+            images global metadata contains the per-frame ``duration`` in
+            frame order while a frame index returns that frame's duration.
         exclude_applied : bool
             If True, exclude metadata fields that are applied to the image while
             reading. For example, if the binary data contains a rotation flag,
@@ -521,9 +575,7 @@ class PillowPlugin(PluginV3):
         """
 
         if index is None:
-            if self._image.format == "GIF":
-                index = Ellipsis
-            elif self._image.custom_mimetype == "image/apng":
+            if _is_animated(self._image):
                 index = Ellipsis
             else:
                 index = 0
@@ -531,9 +583,30 @@ class PillowPlugin(PluginV3):
         if isinstance(index, int) and self._image.tell() != index:
             self._image.seek(index)
 
+        if index is Ellipsis and _is_animated(self._image):
+            # global metadata of an animated image reports the per-frame
+            # durations in frame order. Pillow only populates the duration of
+            # the current frame (and, for WebP, only after load()), so walk
+            # through all frames to collect them.
+            durations = []
+            current_index = self._image.tell()
+            for frame_index in range(self._image.n_frames):
+                self._image.seek(frame_index)
+                self._image.load()
+                durations.append(self._image.info.get("duration"))
+            self._image.seek(current_index)
+
         metadata = self._image.info.copy()
         metadata["mode"] = self._image.mode
         metadata["shape"] = self._image.size
+
+        if index is Ellipsis and _is_animated(self._image):
+            metadata["duration"] = durations
+        elif isinstance(index, int) and _is_animated(self._image):
+            # make sure the reported duration belongs to the requested frame;
+            # WebP only exposes it after the frame was loaded
+            self._image.load()
+            metadata["duration"] = self._image.info.get("duration")
 
         if self._image.mode == "P" and not exclude_applied:
             metadata["palette"] = np.asarray(tuple(self._image.palette.colors.keys()))
@@ -561,9 +634,9 @@ class PillowPlugin(PluginV3):
             properties. If index is an ellipsis (...), read and return the
             properties of all ndimages in the file stacked along a new batch
             dimension. If index is None, this plugin reads and returns the
-            properties of the first image (index=0) unless the image is a GIF or
-            APNG, in which case it reads and returns the properties all images
-            (index=...).
+            properties of the first image (index=0) unless the image is
+            animated, in which case it reads and returns the properties of all
+            images (index=...).
 
         Returns
         -------
@@ -577,9 +650,7 @@ class PillowPlugin(PluginV3):
         """
 
         if index is None:
-            if self._image.format == "GIF":
-                index = Ellipsis
-            elif self._image.custom_mimetype == "image/apng":
+            if _is_animated(self._image):
                 index = Ellipsis
             else:
                 index = 0

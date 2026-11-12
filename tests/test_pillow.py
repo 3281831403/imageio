@@ -321,13 +321,122 @@ def test_gif_irregular_duration(test_images, tmp_path):
         plugin="pillow",
         mode="RGBA",
     )
-    duration = [0.5 if idx in [2, 5, 7] else 0.1 for idx in range(im.shape[0])]
+    # durations are given in milliseconds; GIF quantizes them to 10ms steps
+    duration = [500 if idx in [2, 5, 7] else 100 for idx in range(im.shape[0])]
 
     with iio.imopen(tmp_path / "test.gif", "w", plugin="pillow") as file:
-        for frame, duration in zip(im, duration):
-            file.write(frame, duration=duration)
+        for frame, frame_duration in zip(im, duration):
+            file.write(frame, duration=frame_duration)
 
-    # how to assert duration here
+    # every frame keeps the duration it was written with
+    meta = iio.immeta(tmp_path / "test.gif")
+    assert meta["duration"] == duration
+    for idx, expected in enumerate(duration):
+        assert iio.immeta(tmp_path / "test.gif", index=idx)["duration"] == expected
+
+
+@pytest.mark.parametrize("extension", ["gif", "apng", "webp"])
+def test_streamed_per_frame_duration(tmp_path, extension):
+    # regression test: streamed writes used to overwrite the duration of every
+    # frame with the duration of the last write() call
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 255, (5, 16, 16, 3), dtype=np.uint8)
+    durations = [100, 200, 300, 150, 250]
+
+    path = tmp_path / f"streamed.{extension}"
+    with iio.imopen(path, "w", plugin="pillow") as file:
+        for frame, duration in zip(frames, durations):
+            file.write(frame, duration=duration, loop=2)
+
+    # durations are stored per frame in the container
+    with Image.open(path) as container:
+        container_durations = []
+        for idx in range(container.n_frames):
+            container.seek(idx)
+            container.load()  # WebP only exposes duration after load()
+            container_durations.append(container.info["duration"])
+        assert container.info["loop"] == 2
+
+    if extension == "gif":
+        # GIF stores duration in steps of 10ms
+        assert container_durations == durations
+    else:
+        assert container_durations == [float(d) for d in durations]
+
+    # global metadata reports the durations in frame order ...
+    meta = iio.immeta(path)
+    assert list(meta["duration"]) == container_durations
+
+    # ... while querying a single frame returns that frame's duration,
+    # independently of the reader's current position
+    for idx, expected in enumerate(container_durations):
+        frame_meta = iio.immeta(path, index=idx)
+        assert frame_meta["duration"] == expected
+
+    # querying a frame must not change a subsequent global query
+    iio.immeta(path, index=3)
+    assert list(iio.immeta(path)["duration"]) == container_durations
+
+    # every frame is read back, pixel by pixel
+    read_back = iio.imread(path)
+    assert read_back.shape == frames.shape
+    with Image.open(path) as container:
+        for idx, expected_frame in enumerate(frames):
+            container.seek(idx)
+            reference = np.asarray(container.convert("RGB"))
+            assert np.allclose(read_back[idx], reference)
+
+    # animated containers report their number of frames, including WebP
+    properties = iio.improps(path)
+    assert properties.n_images == len(frames)
+    assert properties.shape == frames.shape
+    assert properties.is_batch is True
+
+
+def test_streamed_duration_inheritance(tmp_path):
+    # a write() call without duration must not clobber earlier durations;
+    # the frame inherits the most recent duration
+    rng = np.random.default_rng(1)
+    frames = rng.integers(0, 255, (3, 8, 8, 3), dtype=np.uint8)
+
+    path = tmp_path / "partial.webp"
+    with iio.imopen(path, "w", plugin="pillow") as file:
+        file.write(frames[0], duration=120)
+        file.write(frames[1])
+        file.write(frames[2], duration=340)
+
+    assert iio.immeta(path)["duration"] == [120, 120, 340]
+
+
+def test_oneshot_per_frame_duration(tmp_path):
+    # one-shot writes with a list of durations keep working unchanged
+    rng = np.random.default_rng(2)
+    frames = rng.integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)
+    durations = [40, 80, 120, 160]
+
+    for extension in ("gif", "apng", "webp"):
+        path = tmp_path / f"oneshot.{extension}"
+        iio.imwrite(path, frames, plugin="pillow", duration=durations)
+        assert list(iio.immeta(path)["duration"]) == (
+            durations if extension == "gif" else [float(d) for d in durations]
+        )
+
+
+def test_single_frame_has_no_duration_list(tmp_path):
+    # single-frame files must keep reporting scalar (or missing) durations
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    for extension in ("gif", "apng", "webp", "png"):
+        path = tmp_path / f"single.{extension}"
+        iio.imwrite(path, frame, plugin="pillow")
+
+        properties = iio.improps(path)
+        assert properties.n_images is None
+        assert properties.shape == frame.shape
+        assert properties.is_batch is False
+
+        metadata = iio.immeta(path)
+        assert not isinstance(metadata.get("duration"), list)
 
 
 def test_gif_palletsize(test_images, tmp_path):
@@ -353,9 +462,19 @@ def test_gif_loop_and_duration(test_images, tmp_path):
 
     with iio.imopen(tmp_path / "test.gif", "w", plugin="pillow") as file:
         for frame in im:
-            file.write(frame, palettesize=100, duration=0.00005, loop=2)
+            # 25ms is not a multiple of the GIF's 10ms resolution
+            file.write(frame, palettesize=100, duration=25, loop=2)
 
-    # This test had no assert; how to assert fps and loop count?
+    # the loop count is written into the container and every frame carries
+    # its own duration, quantized to GIF's 10ms resolution
+    with Image.open(tmp_path / "test.gif") as container:
+        assert container.info["loop"] == 2
+        for idx in range(container.n_frames):
+            container.seek(idx)
+            container.load()
+            assert container.info["duration"] == 20
+
+    assert all(d == 20 for d in iio.immeta(tmp_path / "test.gif")["duration"])
 
 
 def test_gif_indexed_read(test_images):
