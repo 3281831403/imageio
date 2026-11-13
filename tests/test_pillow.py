@@ -71,6 +71,47 @@ def test_write_multiframe(test_images, tmp_path, im_npy, im_out, im_comp):
     assert iio_file.read_bytes() == pil_file.read_bytes()
 
 
+def test_write_multipage_tiff(tmp_path):
+    # Regression test: writing multi-page TIFFs uses Pillow's
+    # AppendingTiffWriter, which needs to read from and seek in the target
+    # file. This fails on files opened in write-only mode ("wb"), so the
+    # plugin buffers the save when the target file is not readable.
+    frames = [np.full((8, 8), i * 40, dtype=np.uint8) for i in range(3)]
+
+    # one-shot write to a path
+    batch_file = tmp_path / "batch.tif"
+    iio.imwrite(batch_file, np.stack(frames), plugin="pillow")
+
+    # frame-by-frame write to a path
+    iter_file = tmp_path / "iter.tif"
+    with iio.imopen(iter_file, "w", plugin="pillow") as file:
+        for frame in frames:
+            file.write(frame)
+
+    # one-shot write to a file object opened in write-only mode
+    wb_file = tmp_path / "wb.tif"
+    with open(wb_file, "wb") as file_object:
+        iio.imwrite(file_object, np.stack(frames), plugin="pillow", extension=".tif")
+
+    # frame-by-frame write to a file object opened in write-only mode
+    wb_iter_file = tmp_path / "wb_iter.tif"
+    with open(wb_iter_file, "wb") as file_object:
+        with iio.imopen(
+            file_object, "w", plugin="pillow", extension=".tif"
+        ) as file:
+            for frame in frames:
+                file.write(frame)
+
+    for tif_file in (batch_file, iter_file, wb_file, wb_iter_file):
+        props = iio.improps(tif_file, plugin="pillow", index=...)
+        assert props.n_images == 3
+
+        actual = iio.imread(tif_file, plugin="pillow", index=...)
+        assert actual.shape == (3, 8, 8)
+        for idx, frame in enumerate(frames):
+            assert np.array_equal(actual[idx], frame)
+
+
 def test_png_compression(test_images, tmp_path):
     # Note: Note sure if we should test this or pillow
 

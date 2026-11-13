@@ -46,6 +46,14 @@ def pillow_version() -> Tuple[int]:
     return tuple(int(x) for x in pil_version.split("."))
 
 
+def _is_readable(file) -> bool:
+    """Check if a file(-like) object supports reading."""
+    try:
+        return file.readable()
+    except AttributeError:
+        return hasattr(file, "read")
+
+
 def _exif_orientation_transform(orientation: int, mode: str) -> Callable:
     # get transformation that transforms an image from a
     # given EXIF orientation into the standard orientation
@@ -486,7 +494,22 @@ class PillowPlugin(PluginV3):
             self.save_args["save_all"] = True
             self.save_args["append_images"] = self.images_to_write
 
-        primary_image.save(self._request.get_file(), **self.save_args)
+        file = self._request.get_file()
+        if (
+            self.save_args.get("format") == "TIFF"
+            and self.save_args.get("save_all", False)
+            and not _is_readable(file)
+        ):
+            # Pillow writes multi-page TIFFs using AppendingTiffWriter, which
+            # needs to read from and seek in the target file. This fails for
+            # files opened in write-only mode (e.g. "wb"), so save into an
+            # intermediate buffer and copy the bytes into the actual file.
+            buffer = BytesIO()
+            primary_image.save(buffer, **self.save_args)
+            file.write(buffer.getvalue())
+        else:
+            primary_image.save(file, **self.save_args)
+
         self.images_to_write.clear()
         self.save_args.clear()
 
