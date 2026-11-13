@@ -70,6 +70,10 @@ class LegacyPlugin(PluginV3):
         """
         self._request = request
         self._format = legacy_plugin
+        # A legacy writer that is kept open across ``write`` calls so that
+        # frames written incrementally accumulate instead of each call
+        # overwriting the file. It is flushed/closed in ``close``.
+        self._writer = None
 
         source = (
             "<bytes>"
@@ -234,25 +238,51 @@ class LegacyPlugin(PluginV3):
             if batch_dims == 0:
                 ndimage = [ndimage]
 
-        with self.legacy_get_writer(**kwargs) as writer:
-            for image in ndimage:
-                image = np.asanyarray(image)
+        if self._writer is None:
+            self._writer = self.legacy_get_writer(**kwargs)
+        writer = self._writer
 
-                if image.ndim < 2:
-                    raise ValueError(
-                        "The image must have at least two spatial dimensions."
-                    )
+        for image in ndimage:
+            image = np.asanyarray(image)
 
-                if not np.issubdtype(image.dtype, np.number) and not np.issubdtype(
-                    image.dtype, bool
-                ):
-                    raise ValueError(
-                        f"All images have to be numeric, and not `{image.dtype}`."
-                    )
+            if image.ndim < 2:
+                raise ValueError(
+                    "The image must have at least two spatial dimensions."
+                )
 
-                writer.append_data(image, metadata)
+            if not np.issubdtype(image.dtype, np.number) and not np.issubdtype(
+                image.dtype, bool
+            ):
+                raise ValueError(
+                    f"All images have to be numeric, and not `{image.dtype}`."
+                )
 
-        return writer.request.get_result()
+            writer.append_data(image, metadata)
+
+        if self._request.raw_uri == "<bytes>":
+            # Bytes targets are single-shot: each write must return the
+            # encoded data, so finalize the writer (and request) now.
+            self._finalize_writer()
+
+        return self._request.get_result()
+
+    def _finalize_writer(self):
+        """Close the legacy writer kept open across ``write`` calls.
+
+        Closing the writer flushes any frames buffered by the legacy plugin
+        (e.g. NPZ collects all images and writes them at close) and finishes
+        the request.
+        """
+
+        if self._writer is not None:
+            writer, self._writer = self._writer, None
+            writer.close()
+
+    def close(self) -> None:
+        """Close the ImageResource, flushing any pending writes."""
+
+        self._finalize_writer()
+        super().close()
 
     def iter(self, **kwargs):
         """Iterate over a list of ndimages given by the URI
@@ -356,8 +386,14 @@ class LegacyPlugin(PluginV3):
         return self.legacy_get_reader().get_meta_data(index=index)
 
     def __del__(self) -> None:
-        pass
-        # turns out we can't close the file here for LegacyPlugin
+        # turns out we can't close the request here for LegacyPlugin
         # because it would break backwards compatibility
         # with legacy_get_writer and legacy_get_reader
         # self._request.finish()
+        #
+        # We do, however, flush a writer created by ``write`` so that frames
+        # aren't lost when the plugin is garbage collected without ``close``.
+        try:
+            self._finalize_writer()
+        except Exception:
+            pass  # Suppress noise when called during interpreter shutdown

@@ -1,4 +1,5 @@
 import imageio as iio
+import numpy as np
 import pytest
 
 
@@ -51,3 +52,28 @@ def test_properties(test_images):
     assert p.shape == (150, 200, 4)
     assert p.n_images is None
     assert not p.is_batch
+
+
+@pytest.mark.parametrize("extension", [".npz", ".bsdf"])
+def test_incremental_write(tmp_path, extension):
+    # regression test: frames written incrementally via the v3 API must
+    # accumulate in the file instead of each `write` overwriting the
+    # frames written before it
+    frames = [np.full((8, 8), i, dtype=np.uint8) for i in range(5)]
+
+    fname = tmp_path / f"incremental{extension}"
+    with iio.v3.imopen(fname, "w") as file:
+        for frame in frames:
+            file.write(frame)
+
+    props = iio.v3.improps(fname, index=...)
+    assert props.n_images == 5
+    assert props.shape == (5, 8, 8)
+    assert props.dtype == np.uint8
+
+    for actual, expected in zip(iio.v3.imiter(fname), frames):
+        assert actual.dtype == expected.dtype
+        assert actual.shape == expected.shape
+        np.testing.assert_array_equal(actual, expected)
+
+    assert len(iio.v2.mimread(fname)) == 5
