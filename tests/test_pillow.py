@@ -298,6 +298,58 @@ def test_gif_gray(test_images, tmp_path):
     )
 
 
+def test_gif_grayscale_roundtrip(tmp_path):
+    # Regression test: multi-frame grayscale GIFs failed to read with
+    # pillow>=12 ("No packer found from P to L" / missing frame palettes),
+    # because pillow decodes grayscale-palette frames as "L" while other
+    # frames stay "P" or become "RGB". All frames of a grayscale GIF must
+    # read back as consistent 2D grayscale images, pixel-exactly.
+    import imageio.v2 as iio2
+
+    rng = np.random.default_rng(42)
+    frames = [rng.integers(0, 256, (8, 8), dtype=np.uint8) for _ in range(3)]
+    # frames sharing a shifted grayscale ramp palette exercise pillow's
+    # palette-less ("L") frame decoding path
+    ramp = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    frames += [ramp + 1, ramp + 2]
+    src = np.stack(frames)
+
+    fname = tmp_path / "gray.gif"
+    iio.imwrite(fname, src, extension=".gif")
+
+    # v3: reading all frames yields a consistent 2D-grayscale batch
+    im = iio.imread(fname)
+    assert im.shape == src.shape
+    assert np.array_equal(im, src)
+
+    # v3: iterating and per-index reads agree with the batch read
+    for i, frame in enumerate(iio.imiter(fname)):
+        assert frame.shape == (8, 8)
+        assert np.array_equal(frame, src[i])
+    for i in range(len(src)):
+        assert np.array_equal(iio.imread(fname, index=i), src[i])
+
+    # v3: properties match the read shape
+    props = iio.improps(fname)
+    assert props.shape == src.shape
+    assert props.dtype == np.uint8
+    assert props.n_images == len(src)
+
+    # v3: explicit mode conversion still works
+    im_rgb = iio.imread(fname, mode="RGB")
+    assert im_rgb.shape == (*src.shape, 3)
+    assert np.array_equal(im_rgb[..., 0], src)
+
+    # v2: default (v3 plugin) and legacy GIF-PIL readers
+    for reader in (iio2.mimread,):
+        for kwargs in ({}, {"format": "GIF-PIL"}):
+            frames_out = reader(fname, **kwargs)
+            assert len(frames_out) == len(src)
+            for frame, expected in zip(frames_out, src):
+                assert frame.shape == (8, 8)
+                assert np.array_equal(frame, expected)
+
+
 def test_gif_fps_warning(test_images, tmp_path):
     im = iio.imread(
         test_images / "newtonscradle.gif",

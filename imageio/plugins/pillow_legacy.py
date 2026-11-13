@@ -172,6 +172,7 @@ import numpy as np
 
 from ..core import Format, image_as_uint
 from ..core.request import URI_FILE, URI_BYTES
+from .pillow import _gif_frame_is_grayscale, _repair_gif_frame
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +297,11 @@ class PillowFormat(Format):
             self._kwargs = dict(
                 as_gray=as_gray, is_gray=_palette_is_grayscale(self._im)
             )
+            if self._im.format == "GIF":
+                # pillow>=12 decodes grayscale-palette GIF frames as "L",
+                # so inspect the frame (not just a P-mode palette) to
+                # detect grayscale GIFs
+                self._kwargs["is_gray"] = _gif_frame_is_grayscale(self._im)
             # setting mode=None is not the same as just not providing it
             if pilmode is not None:
                 self._kwargs["mode"] = pilmode
@@ -335,6 +341,10 @@ class PillowFormat(Format):
                     self._seek(i)
             if self._im.palette and self._im.palette.dirty:
                 self._im.palette.rawmode_saved = self._im.palette.rawmode
+            if self._im.format == "GIF":
+                # repair frames broken by pillow>=12's grayscale-palette
+                # decoding before they are loaded
+                _repair_gif_frame(self._im)
             self._im.load()
             im = pil_get_frame(self._im, **self._kwargs)
             return im, self._im.info
@@ -663,7 +673,12 @@ def _palette_is_grayscale(pil_image):
         return False
     # get palette as an array with R, G, B columns
     # Note: starting in pillow 9.1 palettes may have less than 256 entries
-    palette = np.asarray(pil_image.getpalette()).reshape((-1, 3))
+    raw_palette = pil_image.getpalette()
+    if raw_palette is None:
+        # P-mode image without a palette (e.g. a palette-less grayscale
+        # GIF frame as produced by pillow>=12)
+        return True
+    palette = np.asarray(raw_palette).reshape((-1, 3))
     # Not all palette colors are used; unused colors have junk values.
     start, stop = pil_image.getextrema()
     valid_palette = palette[start : stop + 1]
@@ -701,7 +716,7 @@ def pil_get_frame(im, is_gray=None, as_gray=None, mode=None, dtype=None):
         if im.info.get("transparency", None) is not None:
             # Let Pillow apply the transparency, see issue #210 and #246
             frame = im.convert("RGBA")
-        elif im.palette.mode in ("RGB", "RGBA"):
+        elif im.palette is not None and im.palette.mode in ("RGB", "RGBA"):
             # We can do this ourselves. Pillow seems to sometimes screw
             # this up if a  multi-gif has a palette for each frame ...
             # Create palette array
@@ -742,6 +757,10 @@ def pil_get_frame(im, is_gray=None, as_gray=None, mode=None, dtype=None):
         frame = im.convert("RGBA")
     elif im.mode == "CMYK":
         frame = im.convert("RGB")
+    elif im.format == "GIF" and im.mode == "RGB" and is_gray:
+        # grayscale-palette GIF frame that pillow converted to RGB; keep
+        # all frames of a grayscale GIF consistently 2D
+        frame = im.convert("L")
     elif im.format == "GIF" and im.mode == "RGB":
         # pillow9 returns RGBA images for subsequent frames so that it can deal
         # with multi-frame GIF that use frame-level palettes and don't dispose

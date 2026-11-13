@@ -46,6 +46,79 @@ def pillow_version() -> Tuple[int]:
     return tuple(int(x) for x in pil_version.split("."))
 
 
+def _gif_palette_is_grayscale(palette) -> bool:
+    """Check if a PIL palette maps every index to a gray value."""
+
+    if palette.mode == "L":
+        return True
+    if palette.mode not in ("RGB", "RGBA"):
+        return False
+
+    if hasattr(palette, "getdata"):
+        _, palette_bytes = palette.getdata()
+    else:  # pragma: no cover
+        palette_bytes = palette.palette
+    data = np.frombuffer(palette_bytes, dtype=np.uint8)
+    n_channels = len(palette.mode)
+    data = data[: data.size // n_channels * n_channels].reshape(-1, n_channels)
+    return bool(np.all(data[:, 0:1] == data[:, 1:3]))
+
+
+def _gif_frame_is_grayscale(image) -> bool:
+    """Detect whether a GIF frame carries only gray values."""
+
+    if "transparency" in image.info:
+        # preserve the existing behavior for transparent GIFs
+        return False
+
+    if image.mode == "P":
+        palette = image.palette or getattr(image, "_frame_palette", None)
+        if palette is None:
+            # palette-less P frames hold raw (grayscale) indices
+            return True
+        return _gif_palette_is_grayscale(palette)
+
+    if image.mode == "RGB":
+        # RGB frames in GIFs are P frames converted by pillow's loading
+        # strategy; the frame's palette (if still around) tells the truth
+        palette = getattr(image, "_frame_palette", None)
+        if palette is not None:
+            return _gif_palette_is_grayscale(palette)
+        # otherwise (e.g. an already-decoded frame) inspect the pixels
+        a = np.asarray(image)
+        return bool(np.all(a[..., 0] == a[..., 1]) and np.all(a[..., 1] == a[..., 2]))
+
+    return image.mode in ("1", "L", "LA", "I", "F")
+
+
+def _repair_gif_frame(image) -> None:
+    """Work around a pillow>=12 bug decoding grayscale-palette GIF frames.
+
+    When a paletted GIF frame follows a palette-less (grayscale) frame,
+    pillow keeps the previous frame's "L" core image while the new frame
+    needs mode "P", and drops the frame's palette. Such frames fail to
+    read with ``ValueError: No packer found from P to L`` (the frame's
+    mode flips from "L" to "P" while it is being decoded). Re-attaching
+    the frame palette, dropping the stale core image (so that a fresh
+    one matching the frame's mode is allocated), and decoding the frame
+    while its state is consistent makes the frame readable again. This
+    is a no-op for consistent frames and for pillow<12, which lacks the
+    attributes involved.
+    """
+
+    frame_palette = getattr(image, "_frame_palette", None)
+    core = getattr(image, "_im", None)
+    if frame_palette is None or core is None or core.mode != "L":
+        return
+
+    if image.palette is None:
+        image.palette = frame_palette
+    image._im = None
+    # decode now; afterwards the frame's mode is "P" and its palette is
+    # attached, so downstream conversions see a consistent image
+    image.load()
+
+
 def _exif_orientation_transform(orientation: int, mode: str) -> Callable:
     # get transformation that transforms an image from a
     # given EXIF orientation into the standard orientation
@@ -100,6 +173,7 @@ class PillowPlugin(PluginV3):
 
         self._image: Image = None
         self.images_to_write = []
+        self._gif_grayscale: Optional[bool] = None
 
         if request.mode.io_mode == IOMode.read:
             try:
@@ -302,8 +376,28 @@ class PillowPlugin(PluginV3):
     def _apply_transforms(
         self, image, mode, rotate, apply_gamma, writeable_output
     ) -> np.ndarray:
+        if image.format == "GIF":
+            _repair_gif_frame(image)
+
         if mode is not None:
             image = image.convert(mode)
+        elif image.format == "GIF":
+            # Read grayscale GIFs as 2D images. Pillow>=12 decodes
+            # grayscale-palette frames as "L", so frames of the same GIF
+            # may arrive in different modes; normalize them per-GIF so
+            # that all frames share one consistent shape.
+            if self._gif_grayscale is None:
+                self._gif_grayscale = _gif_frame_is_grayscale(image)
+            if self._gif_grayscale:
+                if image.mode != "L":
+                    image = image.convert("L")
+            elif image.mode == "P":
+                # adjust for pillow9 changes
+                # see: https://github.com/python-pillow/Pillow/issues/5929
+                image = image.convert(image.palette.mode)
+            elif image.mode == "L":
+                # grayscale-palette frame inside a color GIF
+                image = image.convert("RGB")
         elif image.mode == "P":
             # adjust for pillow9 changes
             # see: https://github.com/python-pillow/Pillow/issues/5929
@@ -536,7 +630,11 @@ class PillowPlugin(PluginV3):
         metadata["shape"] = self._image.size
 
         if self._image.mode == "P" and not exclude_applied:
-            metadata["palette"] = np.asarray(tuple(self._image.palette.colors.keys()))
+            palette = self._image.palette or getattr(
+                self._image, "_frame_palette", None
+            )
+            if palette is not None:
+                metadata["palette"] = np.asarray(tuple(palette.colors.keys()))
 
         if self._image.getexif():
             exif_data = {
@@ -589,7 +687,22 @@ class PillowPlugin(PluginV3):
         else:
             self._image.seek(index)
 
-        if self._image.mode == "P":
+        if self._image.format == "GIF":
+            # mirror the mode normalization applied when reading so that
+            # properties match the shape of the returned ndimage
+            if self._gif_grayscale is None:
+                self._gif_grayscale = _gif_frame_is_grayscale(self._image)
+            if self._gif_grayscale:
+                mode = "L"
+            elif self._image.mode == "P":
+                # mode of palette images is determined by their palette
+                palette = self._image.palette or getattr(
+                    self._image, "_frame_palette", None
+                )
+                mode = palette.mode if palette is not None else "L"
+            else:
+                mode = self._image.mode
+        elif self._image.mode == "P":
             # mode of palette images is determined by their palette
             mode = self._image.palette.mode
         else:
