@@ -26,7 +26,7 @@ class GIFFormat(PillowFormat):
 
     # GIF reader needs no modifications compared to base pillow reader
 
-    class Writer(PillowFormat.Writer):  # pragma: no cover
+    class Writer(PillowFormat.Writer):
         def _open(
             self,
             loop=0,
@@ -36,16 +36,6 @@ class GIFFormat(PillowFormat):
             quantizer=0,
             subrectangles=False,
         ):
-            from PIL import __version__ as pillow_version
-
-            major, minor, patch = tuple(int(x) for x in pillow_version.split("."))
-            if major == 10 and minor >= 1:
-                raise ImportError(
-                    f"Pillow v{pillow_version} is not supported by ImageIO's legacy "
-                    "pillow plugin when writing GIFs. Consider switching to the new "
-                    "plugin or downgrading to `pillow<10.1.0`."
-                )
-
             # Check palettesize
             palettesize = int(palettesize)
             if palettesize < 2 or palettesize > 256:
@@ -98,7 +88,38 @@ def intToBin(i):
     return i.to_bytes(2, byteorder="little")
 
 
-class GifWriter:  # pragma: no cover
+def _normalize_color_table(palette):
+    """Determine the GIF color table size for ``palette``.
+
+    A GIF color table must contain a power-of-two number of entries (2 to
+    256) and the packed field in the header/descriptor stores
+    ``log2(entries) - 1`` in its lower three bits. Pillow usually returns a
+    padded palette, but we derive the size from the palette we actually
+    write and pad/truncate it to match. Otherwise the header advertises a
+    table that is not there, and decoders read the image data as palette
+    bytes, which corrupts the file.
+
+    Returns ``(palette, table_size)`` where ``table_size`` is the value to
+    OR into the packed field.
+    """
+    palette = bytes(palette)
+    # palettes are sequences of RGB triples; drop any trailing partial entry
+    palette = palette[: (len(palette) // 3) * 3]
+    n_colors = max(len(palette) // 3, 1)
+    # round up to the next power of two, with a minimum of two and a
+    # maximum of 256 entries (the largest table a GIF supports)
+    n_entries = min(1 << max((n_colors - 1).bit_length(), 1), 256)
+
+    target_length = n_entries * 3
+    if len(palette) < target_length:
+        palette += b"\x00" * (target_length - len(palette))
+    elif len(palette) > target_length:
+        palette = palette[:target_length]
+
+    return palette, n_entries.bit_length() - 2
+
+
+class GifWriter:
     """Class that for helping write the animated GIF file. This is based on
     code from images2gif.py (part of visvis). The version here is modified
     to allow streamed writing.
@@ -134,27 +155,40 @@ class GifWriter:  # pragma: no cover
             im_rect, rect = self.getSubRectangle(im)
         im_pil = self.converToPIL(im_rect, self.opt_quantizer, self.opt_palette_size)
 
-        # Get palette - apparently, this is the 3d element of the header
-        # (but it has not always been). Best we've got. Its not the same
-        # as im_pil.palette.tobytes().
+        # Get the palette Pillow would write. Depending on the Pillow
+        # version the palette lives either in the header element (Pillow
+        # pads it to a power of two) or in the image's palette object (raw,
+        # and RGBA for an RGBA palette mode), so prefer the raw bytes and
+        # fall back to the header.
         from PIL.GifImagePlugin import getheader
 
-        palette = getheader(im_pil)[0][3]
+        header = getheader(im_pil)[0]
+        palette = bytes(im_pil.palette.palette) if im_pil.palette else b""
+        if im_pil.palette is not None and im_pil.palette.mode == "RGBA":
+            palette = b"".join(
+                palette[i : i + 3] for i in range(0, len(palette), 4)
+            )
+        if not palette:
+            palette = header[3] if len(header) > 3 else b""
+        # Make sure the color table we write matches the size we advertise
+        # in the header and in the image descriptor. Otherwise decoders read
+        # image data as palette bytes, which corrupts the file.
+        palette, table_size = _normalize_color_table(palette)
 
         # Write image
         if self._count == 0:
-            self.write_header(im_pil, palette, self.opt_loop)
+            self.write_header(im_pil, palette, table_size, self.opt_loop)
             self._global_palette = palette
-        self.write_image(im_pil, palette, rect, duration, dispose)
+        self.write_image(im_pil, palette, table_size, rect, duration, dispose)
         # assert len(palette) == len(self._global_palette)
 
         # Bookkeeping
         self._previous_image = im
         self._count += 1
 
-    def write_header(self, im, globalPalette, loop):
+    def write_header(self, im, globalPalette, table_size, loop):
         # Gather info
-        header = self.getheaderAnim(im)
+        header = self.getheaderAnim(im, table_size)
         appext = self.getAppExt(loop)
         # Write
         self.fp.write(header)
@@ -164,7 +198,7 @@ class GifWriter:  # pragma: no cover
     def close(self):
         self.fp.write(";".encode("utf-8"))  # end gif
 
-    def write_image(self, im, palette, rect, duration, dispose):
+    def write_image(self, im, palette, table_size, rect, duration, dispose):
         fp = self.fp
 
         # Gather local image header and data, using PIL's getdata. That
@@ -177,8 +211,8 @@ class GifWriter:  # pragma: no cover
             imdes += data.pop(0)
         assert len(imdes) == 11
 
-        # Make image descriptor suitable for using 256 local color palette
-        lid = self.getImageDescriptor(im, rect)
+        # Make image descriptor suitable for using a local color palette
+        lid = self.getImageDescriptor(im, table_size, rect)
         graphext = self.getGraphicsControlExt(duration, dispose)
 
         # Write local header
@@ -197,15 +231,17 @@ class GifWriter:  # pragma: no cover
         for d in data:
             fp.write(d)
 
-    def getheaderAnim(self, im):
+    def getheaderAnim(self, im, table_size=7):
         """Get animation header. To replace PILs getheader()[0]"""
         bb = b"GIF89a"
         bb += intToBin(im.size[0])
         bb += intToBin(im.size[1])
-        bb += b"\x87\x00\x00"
+        # packed field: global color table flag1, color resolution, sorted
+        # table0, size of global color table (log2(entries) - 1)
+        bb += bytes([0x80 | table_size]) + b"\x00\x00"
         return bb
 
-    def getImageDescriptor(self, im, xy=None):
+    def getImageDescriptor(self, im, table_size=7, xy=None):
         """Used for the local color table properties per image.
         Otherwise global color table applies to all frames irrespective of
         whether additional colors comes in play that require a redefined
@@ -229,8 +265,8 @@ class GifWriter:  # pragma: no cover
         bb += intToBin(im.size[1])  # image height
 
         # packed field: local color table flag1, interlace0, sorted table0,
-        # reserved00, lct size111=7=2^(7 + 1)=256.
-        bb += b"\x87"
+        # reserved00, size of local color table (log2(entries) - 1).
+        bb += bytes([0x80 | table_size])
 
         # LZW minimum size code now comes later, beginning of [imagedata] blocks
         return bb
@@ -302,8 +338,8 @@ class GifWriter:  # pragma: no cover
         Y = np.argwhere(diff.sum(1))
         # Get rect coordinates
         if X.size and Y.size:
-            x0, x1 = int(X[0]), int(X[-1] + 1)
-            y0, y1 = int(Y[0]), int(Y[-1] + 1)
+            x0, x1 = int(X[0][0]), int(X[-1][0] + 1)
+            y0, y1 = int(Y[0][0]), int(Y[-1][0] + 1)
         else:  # No change ... make it minimal
             x0, x1 = 0, 2
             y0, y1 = 0, 2

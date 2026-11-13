@@ -286,15 +286,9 @@ def test_gif(tmp_path):
                 fname = fnamebase + "%i.%i.%i.gif" % (isfloat, crop, colors)
                 rim = get_ref_im(colors, crop, isfloat)
 
-                try:
-                    imageio.imsave(fname, rim, format="GIF-PIL")
-                except ImportError:
-                    pytest.xfail("New pillow version is no longer supported.")
+                imageio.imsave(fname, rim, format="GIF-PIL")
 
-                try:
-                    im = imageio.imread(fname, format="GIF-PIL")
-                except SyntaxError:
-                    pytest.xfail("New pillow version is no longer supported.")
+                im = imageio.imread(fname, format="GIF-PIL")
 
                 mul = 255 if isfloat else 1
                 if colors not in (0, 1):
@@ -338,15 +332,9 @@ def test_animated_gif(test_images, tmp_path):
                 ims1 = [x.astype(np.float32) / 256 for x in ims1]
             ims1 = [x[:, :, :colors] for x in ims1]
             fname = fnamebase + ".animated.%i.gif" % colors
-            try:
-                imageio.mimsave(fname, ims1, duration=0.2, format="GIF-PIL")
-            except ImportError:
-                pytest.xfail("Pillow version no longer supported.")
+            imageio.mimsave(fname, ims1, duration=0.2, format="GIF-PIL")
             # Retrieve
-            try:
-                ims2 = imageio.mimread(fname, format="GIF-PIL")
-            except SyntaxError:
-                pytest.xfail("New pillow version is no longer supported.")
+            ims2 = imageio.mimread(fname, format="GIF-PIL")
             ims1 = [x[:, :, :3] for x in ims]  # fresh ref
             ims2 = [x[:, :, :3] for x in ims2]  # discart alpha
             for im1, im2 in zip(ims1, ims2):
@@ -411,6 +399,122 @@ def test_v3_gif(test_images):
         test_images / "newtonscradle.gif", plugin="GIF-PIL", index=None
     )
     assert img.shape == (36, 150, 200, 4)
+
+
+def _make_synthetic_frames(n_frames=6, shape=(32, 48)):
+    """Synthetic frames with a handful of colors, so decoding is lossless."""
+    frames = []
+    strip = shape[1] // n_frames
+    for idx in range(n_frames):
+        frame = np.zeros((*shape, 3), np.uint8)
+        frame[:, :, 1] = 180
+        frame[:, idx * strip : (idx + 1) * strip, 0] = 250
+        frame[:, idx * strip : (idx + 1) * strip, 2] = (idx * 40) % 256
+        frames.append(frame)
+    return frames
+
+
+def _decode_with_pillow(fname):
+    """Decode a GIF using Pillow directly, i.e. as a third party would."""
+    from PIL import Image
+
+    frames = []
+    durations = []
+    with Image.open(fname) as im:
+        for idx in range(im.n_frames):
+            im.seek(idx)
+            frames.append(np.array(im.convert("RGB")))
+            durations.append(im.info.get("duration"))
+        loop = im.info.get("loop")
+    return frames, durations, loop
+
+
+@pytest.mark.parametrize("palettesize", [None, 2, 4, 8, 16, 100, 128, 256])
+@pytest.mark.parametrize("subrectangles", [False, True])
+def test_gif_write_is_decodable_by_pillow(tmp_path, palettesize, subrectangles):
+    """Regression test: GIFs written by GIF-PIL must be valid GIF files.
+
+    The writer used to advertise a 256-entry color table while writing the
+    (usually much smaller) palette Pillow produced. Pillow then read image
+    data as palette bytes and refused the file with an
+    ``UnidentifiedImageError``; this went unnoticed because the write tests
+    were xfailed. Decode with Pillow to make sure it can't happen again.
+    """
+    frames = _make_synthetic_frames()
+    fname = tmp_path / "synthetic.gif"
+
+    kwargs = {"subrectangles": subrectangles}
+    if palettesize is not None:
+        kwargs["palettesize"] = palettesize
+
+    imageio.mimsave(fname, frames, duration=0.2, format="GIF-PIL", **kwargs)
+
+    decoded, durations, _ = _decode_with_pillow(fname)
+    assert len(decoded) == len(frames)
+    for expected, actual in zip(frames, decoded):
+        assert actual.shape == expected.shape
+        assert np.abs(actual.astype(int) - expected.astype(int)).max() <= 2
+    assert durations == [200] * len(frames)
+
+
+def test_gif_single_frame_is_decodable_by_pillow(tmp_path):
+    """A single frame written with GIF-PIL must be a valid GIF too."""
+    frame = _make_synthetic_frames(n_frames=1)[0]
+    fname = tmp_path / "single.gif"
+
+    imageio.imsave(fname, frame, format="GIF-PIL")
+
+    decoded, _, _ = _decode_with_pillow(fname)
+    assert len(decoded) == 1
+    assert np.abs(decoded[0].astype(int) - frame.astype(int)).max() <= 2
+
+
+def test_gif_duration_and_loop_metadata(tmp_path):
+    """`duration` and `loop` keep working and end up in the file."""
+    frames = _make_synthetic_frames(n_frames=4)
+    fname = tmp_path / "meta.gif"
+
+    imageio.mimsave(
+        fname, frames, duration=[0.1, 0.2, 0.3, 0.4], loop=2, format="GIF-PIL"
+    )
+
+    _, durations, loop = _decode_with_pillow(fname)
+    assert durations == [100, 200, 300, 400]
+    assert loop == 2
+
+
+@pytest.mark.parametrize("write_batch", [False, True])
+def test_v3_gif_pil_write_is_decodable_by_pillow(tmp_path, write_batch):
+    """v3 ``imwrite(plugin="GIF-PIL")`` must produce valid GIFs."""
+    frames = _make_synthetic_frames()
+    fname = tmp_path / "v3.gif"
+
+    data = np.stack(frames) if write_batch else frames[0]
+    imageio.v3.imwrite(fname, data, plugin="GIF-PIL", duration=0.2)
+
+    decoded, _, _ = _decode_with_pillow(fname)
+    expected = frames if write_batch else frames[:1]
+    assert len(decoded) == len(expected)
+    for expected_frame, actual in zip(expected, decoded):
+        assert np.abs(actual.astype(int) - expected_frame.astype(int)).max() <= 2
+
+
+def test_gif_pil_unknown_kwargs_raise_type_error(tmp_path):
+    """Unknown kwargs must still raise ``TypeError``."""
+    frame = _make_synthetic_frames(n_frames=1)[0]
+
+    with pytest.raises(TypeError):
+        imageio.imsave(tmp_path / "x.gif", frame, notavalidk=True, format="GIF-PIL")
+
+    with pytest.raises(TypeError):
+        imageio.mimsave(
+            tmp_path / "x.gif", [frame], notavalidk=True, format="GIF-PIL"
+        )
+
+    with pytest.raises(TypeError):
+        imageio.v3.imwrite(
+            tmp_path / "x.gif", [frame], plugin="GIF-PIL", notavalidk=True
+        )
 
 
 @deprecated_test
